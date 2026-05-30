@@ -1,8 +1,18 @@
-# Butterfly
+<p align="center">
+  <img src="butterfly.jpg" width="200">
+</p>
 
-<p align="center"><img src="butterfly.jpg" width="160" alt="Butterfly logo"></p>
+<h1 align="center">Butterfly</h1>
 
-A from-scratch Minecraft Bedrock Edition server software in **Java 21**.
+<p align="center">
+  A from-scratch Minecraft Bedrock Edition server software in **Java 21**.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/github/license/butterfly-mc/butterfly?style=flat-square">
+  <img src="https://img.shields.io/github/stars/butterfly-mc/butterfly?style=flat-square">
+  <img src="https://img.shields.io/github/issues/butterfly-mc/butterfly?style=flat-square">
+</p>
 
 ## The stack
 
