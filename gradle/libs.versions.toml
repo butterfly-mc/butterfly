@@ -1,0 +1,42 @@
+[versions]
+butterflyProtocol = "0.1.0"
+netty = "4.2.10.Final"
+jose4j = "0.9.6"
+fastutil = "8.5.13"
+snappy = "1.1.10.5"
+jline = "3.26.3"
+gson = "2.11.0"
+slf4j = "2.0.13"
+log4j = "2.24.1"
+disruptor = "4.0.0"
+hivemcLeveldb = "1.1.0"
+junit = "5.11.0"
+
+[libraries]
+proto-nbt = { module = "mc.butterfly:nbt", version.ref = "butterflyProtocol" }
+proto-raknet = { module = "mc.butterfly:raknet", version.ref = "butterflyProtocol" }
+proto-crypto = { module = "mc.butterfly:crypto", version.ref = "butterflyProtocol" }
+proto-codec = { module = "mc.butterfly:codec", version.ref = "butterflyProtocol" }
+
+netty-buffer = { module = "io.netty:netty-buffer", version.ref = "netty" }
+netty-transport = { module = "io.netty:netty-transport", version.ref = "netty" }
+netty-codec = { module = "io.netty:netty-codec", version.ref = "netty" }
+netty-epoll = { module = "io.netty:netty-transport-native-epoll", version.ref = "netty" }
+
+jose4j = { module = "org.bitbucket.b_c:jose4j", version.ref = "jose4j" }
+fastutil = { module = "it.unimi.dsi:fastutil", version.ref = "fastutil" }
+snappy = { module = "org.xerial.snappy:snappy-java", version.ref = "snappy" }
+jline = { module = "org.jline:jline", version.ref = "jline" }
+gson = { module = "com.google.code.gson:gson", version.ref = "gson" }
+snakeyaml = { module = "org.snakeyaml:snakeyaml-engine", version = "2.7" }
+
+slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
+log4j-core = { module = "org.apache.logging.log4j:log4j-core", version.ref = "log4j" }
+log4j-slf4j = { module = "org.apache.logging.log4j:log4j-slf4j2-impl", version.ref = "log4j" }
+
+disruptor = { module = "com.lmax:disruptor", version.ref = "disruptor" }
+
+hivemc-leveldb = { module = "com.hivemc.leveldb:leveldb", version.ref = "hivemcLeveldb" }
+hivemc-leveldb-api = { module = "com.hivemc.leveldb:leveldb-api", version.ref = "hivemcLeveldb" }
+
+junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit" }

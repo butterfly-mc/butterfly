@@ -6,3 +6,6 @@ out/
 *.iml
 .vscode/
 .DS_Store
+plugins/
+worlds/
+*.log
