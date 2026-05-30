@@ -5,6 +5,10 @@ import net.butterfly.api.async.WorldView;
 import net.butterfly.api.command.CommandRegistry;
 import net.butterfly.api.entity.Player;
 import net.butterfly.api.event.EventBus;
+import net.butterfly.api.event.events.PlayerChatEvent;
+import net.butterfly.api.event.events.PlayerJoinEvent;
+import net.butterfly.api.event.events.PlayerPreLoginEvent;
+import net.butterfly.api.event.events.PlayerQuitEvent;
 import net.butterfly.api.event.events.ServerStartEvent;
 import net.butterfly.api.event.events.ServerStopEvent;
 import net.butterfly.api.plugin.PluginManager;
@@ -13,6 +17,7 @@ import net.butterfly.api.world.World;
 import net.butterfly.codec.Protocol;
 import net.butterfly.core.command.CommandRegistryImpl;
 import net.butterfly.core.command.DefaultCommands;
+import net.butterfly.core.entity.PlayerImpl;
 import net.butterfly.core.event.EventBusImpl;
 import net.butterfly.core.network.ClientSession;
 import net.butterfly.core.network.ConnectionManager;
@@ -33,6 +38,7 @@ import java.nio.file.Files;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -145,16 +151,151 @@ public final class ButterflyServer implements Server {
 
     private void onSessionCreated(ClientSession session) {
         // Construct the login handler — its constructor wires session.onPackets(...).
-        new LoginFlowHandler(session, serverIdentity);
+        LoginFlowHandler login = new LoginFlowHandler(session, serverIdentity, defaultWorld);
+
+        // Once the handshake captures displayName + xuid (right before AWAIT_CHUNK_RADIUS_REQUEST),
+        // build the PlayerImpl, run PreLogin checks, register them in the online roster and
+        // broadcast Join. The hook fires on the tick thread (decode is dispatched there).
+        login.setOnPlayerSpawn(this::handlePlayerSpawn);
+
+        // Quit cleanup — invoked when the session is torn down (kick or transport drop).
+        login.setOnSessionClosed(() -> handleSessionClosed(session));
+
+        // Chat: dispatched from LoginFlowHandler's ACTIVE state for inbound Text packets.
+        login.setOnChat(this::handleChat);
+
+        // Inbound batches arrive on the Netty event loop. Decode + dispatch mutate session
+        // and world state and fire plugin events, so they MUST run on the tick thread.
+        // Copy the bytes off the ByteBuf synchronously (Netty thread owns the buffer) and
+        // defer the actual handleInboundBatch to the next tick via the scheduler.
+        //
+        // TODO(perf): this funnels every peer's decode through a single tick thread. Once
+        //   ClientSession exposes inbox/outbox queues + a pure decodeBatch step, the
+        //   PhasedPipeline (already constructed in start()) can move decrypt/decompress/
+        //   decode onto its parallel decodePool and encryption onto its parallel encodePool,
+        //   leaving only dispatch on the tick thread. See PhasedPipeline / PeerHandle —
+        //   the workers are wired but not yet exercised per-peer.
         session.rak().onGameBatch(buf -> {
             byte[] wire = new byte[buf.readableBytes()];
             buf.readBytes(wire);
-            try {
-                session.handleInboundBatch(wire);
-            } catch (Exception e) {
-                log.warn("login flow error for {}: {}", session.rak().remote(), e.toString());
-            }
+            scheduler.runOnMain(() -> {
+                try {
+                    session.handleInboundBatch(wire);
+                } catch (Exception e) {
+                    log.warn("login flow error for {}: {}", session.rak().remote(), e.toString());
+                }
+            });
         });
+    }
+
+    /**
+     * Build a {@link PlayerImpl} from the captured login identity, fire
+     * {@link PlayerPreLoginEvent} (kicking the client if cancelled), then add the
+     * player to the online roster and fire {@link PlayerJoinEvent}. Runs on the tick
+     * thread.
+     */
+    private void handlePlayerSpawn(ClientSession session) {
+        String name = session.displayName();
+        String xuid = session.xuid();
+        UUID uuid = uuidFor(name, xuid);
+
+        PlayerImpl player = new PlayerImpl(
+            name, xuid, uuid, defaultWorld, session, this,
+            /* spawnX = */ 0.0, /* spawnY = */ 100.0, /* spawnZ = */ 0.0);
+
+        // PreLogin — cancellable. If a listener cancels, kick the client with the
+        // listener-supplied reason (or a generic fallback) and abort.
+        PlayerPreLoginEvent pre = new PlayerPreLoginEvent(name, xuid);
+        try { eventBus.fire(pre); }
+        catch (Exception e) { log.warn("PlayerPreLoginEvent listener threw for {}: {}", name, e.toString()); }
+        if (pre.isCancelled()) {
+            String reason = pre.getKickReason() != null ? pre.getKickReason() : "Disconnected";
+            log.info("PreLogin cancelled for {}: {}", name, reason);
+            try { player.kick(reason); }
+            catch (Exception e) { log.debug("kick after PreLogin-cancel failed: {}", e.toString()); }
+            return;
+        }
+
+        // Admit the player. {@code putIfAbsent} guards against a duplicate-name race —
+        // we lose the new connection in that case (Bedrock allows only one client per
+        // display name on the same server).
+        Player existing = onlineByName.putIfAbsent(name, player);
+        if (existing != null) {
+            log.info("rejecting duplicate join for {} (already online)", name);
+            try { player.kick("Already connected"); }
+            catch (Exception e) { log.debug("kick on duplicate-join failed: {}", e.toString()); }
+            return;
+        }
+
+        // Join — fire the event with a default join message; listeners may rewrite it.
+        String defaultJoin = name + " joined the game";
+        PlayerJoinEvent join = new PlayerJoinEvent(name, xuid, defaultJoin);
+        try { eventBus.fire(join); }
+        catch (Exception e) { log.warn("PlayerJoinEvent listener threw for {}: {}", name, e.toString()); }
+        String joinMessage = join.getJoinMessage();
+        if (joinMessage != null && !joinMessage.isEmpty()) broadcastSystem(joinMessage);
+    }
+
+    /**
+     * Remove the player from the online roster and fire {@link PlayerQuitEvent}. Idempotent —
+     * second invocations for the same session are silently dropped.
+     */
+    private void handleSessionClosed(ClientSession session) {
+        String name = session.displayName();
+        if (name == null || name.isEmpty()) return;   // never made it past Login
+        Player removed = onlineByName.remove(name);
+        if (removed == null) return;                  // already cleaned up
+
+        String xuid = session.xuid();
+        String defaultQuit = name + " left the game";
+        PlayerQuitEvent quit = new PlayerQuitEvent(name, xuid, defaultQuit);
+        try { eventBus.fire(quit); }
+        catch (Exception e) { log.warn("PlayerQuitEvent listener threw for {}: {}", name, e.toString()); }
+        String quitMessage = quit.getQuitMessage();
+        if (quitMessage != null && !quitMessage.isEmpty()) broadcastSystem(quitMessage);
+    }
+
+    /**
+     * Fire {@link PlayerChatEvent} for an inbound chat message and, if not cancelled,
+     * broadcast it to every online player. The author and message can be rewritten by
+     * listeners.
+     */
+    private void handleChat(String from, String message) {
+        PlayerChatEvent chat = new PlayerChatEvent(from, message);
+        try { eventBus.fire(chat); }
+        catch (Exception e) { log.warn("PlayerChatEvent listener threw for {}: {}", from, e.toString()); }
+        if (chat.isCancelled()) return;
+        String body = chat.getMessage();
+        if (body == null || body.isEmpty()) return;
+        broadcastChat(from, body);
+    }
+
+    /**
+     * Derive a stable UUID for a player from {@code xuid} when available, falling back
+     * to {@code name}-based hashing. Bedrock authoritative identity is XUID for online
+     * players; for offline mode we pick a name-derived UUID so reconnects line up.
+     */
+    private static UUID uuidFor(String name, String xuid) {
+        String seed = (xuid != null && !xuid.isEmpty()) ? "xuid:" + xuid : "name:" + name;
+        return UUID.nameUUIDFromBytes(seed.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    /** Broadcast a system message (no source name) to every online player. */
+    public void broadcastSystem(String message) {
+        if (message == null) return;
+        for (Player p : onlineByName.values()) {
+            try { p.sendMessage(message); }
+            catch (Exception e) { log.debug("broadcastSystem send to {} failed: {}", p.name(), e.toString()); }
+        }
+    }
+
+    /** Broadcast a chat message attributed to {@code from} to every online player. */
+    public void broadcastChat(String from, String message) {
+        if (message == null) return;
+        for (Player p : onlineByName.values()) {
+            try { p.sendChat(from, message); }
+            catch (Exception e) { log.debug("broadcastChat send to {} failed: {}", p.name(), e.toString()); }
+        }
     }
 
     private Collection<net.butterfly.core.tick.PeerHandle> peerHandles() {

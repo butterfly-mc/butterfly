@@ -10,6 +10,11 @@ import net.butterfly.codec.packets.PlayStatusPacket;
 import net.butterfly.codec.packets.RawCapturePacket;
 import net.butterfly.codec.packets.RequestNetworkSettingsPacket;
 import net.butterfly.codec.packets.ServerToClientHandshakePacket;
+import net.butterfly.codec.packets.TextPacket;
+import net.butterfly.core.network.chunk.ChunkSender;
+import net.butterfly.core.world.Chunk;
+import net.butterfly.core.world.SubChunk;
+import net.butterfly.core.world.WorldImpl;
 import net.butterfly.crypto.EcdhKeyExchange;
 import net.butterfly.nbt.VarInts;
 import net.butterfly.raknet.RakConstants;
@@ -21,15 +26,18 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.security.KeyPair;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 
+import static net.butterfly.core.network.ClientSession.LoginState.ACTIVE;
 import static net.butterfly.core.network.ClientSession.LoginState.AWAIT_C2S_HANDSHAKE;
+import static net.butterfly.core.network.ClientSession.LoginState.AWAIT_CHUNK_RADIUS_REQUEST;
 import static net.butterfly.core.network.ClientSession.LoginState.AWAIT_LOGIN;
-import static net.butterfly.core.network.ClientSession.LoginState.AWAIT_REQUEST_NETWORK_SETTINGS;
+import static net.butterfly.core.network.ClientSession.LoginState.AWAIT_PLAYER_INIT;
 import static net.butterfly.core.network.ClientSession.LoginState.AWAIT_RESOURCE_PACK_RESPONSE;
-import static net.butterfly.core.network.ClientSession.LoginState.INGAME;
 
 /**
  * Drives the post-RakNet Bedrock login state machine for a single {@link ClientSession}.
@@ -50,20 +58,54 @@ import static net.butterfly.core.network.ClientSession.LoginState.INGAME;
  *       {@code AWAIT_RESOURCE_PACK_RESPONSE}.</li>
  *   <li>{@code AWAIT_RESOURCE_PACK_RESPONSE}: on ResourcePackClientResponse with
  *       status=COMPLETED, send ResourcePackStack. The client then sends a second
- *       ResourcePackClientResponse with status=COMPLETED again, on which we send a
- *       placeholder StartGame and transition to {@code INGAME}.</li>
+ *       ResourcePackClientResponse with status=COMPLETED again, on which we send
+ *       StartGame plus the post-StartGame registry packets and transition to
+ *       {@code AWAIT_CHUNK_RADIUS_REQUEST}.</li>
+ *   <li>{@code AWAIT_CHUNK_RADIUS_REQUEST}: the client sends {@code RequestChunkRadius}
+ *       (id 0x45) — we cap it at {@link #SERVER_MAX_CHUNK_RADIUS}, reply with
+ *       {@code ChunkRadiusUpdated} (0x46), follow with
+ *       {@code NetworkChunkPublisherUpdate} (0x79), then ship one
+ *       {@code LevelChunk} per chunk in an N×N square around spawn, and finally
+ *       send {@code PlayStatus(PLAYER_SPAWN)}. Transitions to
+ *       {@code AWAIT_PLAYER_INIT}.</li>
+ *   <li>{@code AWAIT_PLAYER_INIT}: on {@code SetLocalPlayerAsInitialised} (id 0x71)
+ *       transitions to {@code ACTIVE}. The player is fully spawned in.</li>
  * </ol>
  *
  * <p>The handler subscribes to the session's RakNet control channel (via
  * {@code rak.onControlPacket}) for Connection Request / Connected Ping, and to the
  * decoded packet stream (via {@code session.onPackets}) for game-flow packets. RakNet
  * wiring is the caller's responsibility — see {@link #attach()}.
+ *
+ * <p>Note: {@link #SERVER_MAX_CHUNK_RADIUS} is the absolute cap on the negotiated
+ * radius; for the MVP we still ship a fixed {@link #INITIAL_CHUNK_RADIUS}-sized
+ * square of chunks regardless of what the client asked for. {@link WorldImpl#loadChunk}
+ * is synchronous, so the chunk burst will block the simulate thread for ~25 reads
+ * — acceptable for the single-player MVP.
  */
 public final class LoginFlowHandler {
     private static final Logger log = LoggerFactory.getLogger(LoginFlowHandler.class);
 
     /** Server-wide entity runtime id allocator. Player 1 gets 1, etc. */
     private static final AtomicLong RUNTIME_ID_SEQ = new AtomicLong(0L);
+
+    /** Hard cap on the chunk-view radius the server will hand back to the client. */
+    private static final int SERVER_MAX_CHUNK_RADIUS = 8;
+
+    /** Fixed chunk radius the MVP ships around spawn — 5×5 = 25 chunks. */
+    private static final int INITIAL_CHUNK_RADIUS = 2;
+
+    /** Spawn block coordinates. Mirrors {@link StartGameTemplate#withDynamicFields}. */
+    private static final int SPAWN_BLOCK_X = 0;
+    private static final int SPAWN_BLOCK_Y = 100;
+    private static final int SPAWN_BLOCK_Z = 0;
+
+    /** Bedrock packet ids handled by RawCapturePacket since they are not yet
+     *  registered in butterfly-protocol's {@code BedrockCodecs.protocol975()}. */
+    private static final int ID_REQUEST_CHUNK_RADIUS = 0x45;
+    private static final int ID_CHUNK_RADIUS_UPDATED = 0x46;
+    private static final int ID_NETWORK_CHUNK_PUBLISHER_UPDATE = 0x79;
+    private static final int ID_SET_LOCAL_PLAYER_AS_INITIALISED = 0x71;
 
     /** Server identity shared across all sessions — generated once at startup. */
     public record ServerIdentity(KeyPair keyPair) {
@@ -72,9 +114,26 @@ public final class LoginFlowHandler {
 
     private final ClientSession session;
     private final ServerIdentity serverIdentity;
+    private final WorldImpl world;
 
     /** Fresh ECDH salt generated at the handshake step; kept until enableEncryption fires. */
     private byte[] handshakeSalt;
+
+    /**
+     * Optional callback invoked once the handshake has captured the player's display name
+     * and XUID — fired right before {@code AWAIT_CHUNK_RADIUS_REQUEST} is entered (i.e.
+     * after StartGame + registries have been shipped). The session is no longer in a
+     * partial-handshake state; the listener may safely build a {@code PlayerImpl} and
+     * fire {@code PlayerJoinEvent}. May be {@code null} (default no-op).
+     */
+    private Consumer<ClientSession> onPlayerSpawn = s -> {};
+
+    /**
+     * Optional callback invoked when the underlying session has been disconnected — the
+     * listener uses this to remove the player from the online roster and fire
+     * {@code PlayerQuitEvent}. May be {@code null} (default no-op).
+     */
+    private Runnable onSessionClosed = () -> {};
 
     /**
      * How many ResourcePackClientResponse(status=COMPLETED) we've seen. The client sends
@@ -83,12 +142,52 @@ public final class LoginFlowHandler {
      */
     private int resourcePackCompletedCount = 0;
 
-    public LoginFlowHandler(ClientSession session, ServerIdentity serverIdentity) {
+    public LoginFlowHandler(ClientSession session, ServerIdentity serverIdentity, WorldImpl world) {
         this.session = session;
         this.serverIdentity = serverIdentity;
+        this.world = world;
+    }
+
+    /** Test-only constructor — login flow without a world. Chunk-burst states are unreachable. */
+    public LoginFlowHandler(ClientSession session, ServerIdentity serverIdentity) {
+        this(session, serverIdentity, null);
     }
 
     public ClientSession session() { return session; }
+
+    /**
+     * Install the spawn-time callback. Invoked once StartGame + registry packets have
+     * been shipped and the session has captured a display name + XUID. Listeners
+     * typically build a {@code PlayerImpl}, fire {@code PlayerPreLoginEvent} (and kick
+     * if cancelled), then add the player to the online roster and fire
+     * {@code PlayerJoinEvent}. Pass {@code null} to clear.
+     */
+    public void setOnPlayerSpawn(Consumer<ClientSession> callback) {
+        this.onPlayerSpawn = callback != null ? callback : s -> {};
+    }
+
+    /**
+     * Install the disconnect callback. Listeners typically remove the player from
+     * the online roster and fire {@code PlayerQuitEvent}. Pass {@code null} to clear.
+     */
+    public void setOnSessionClosed(Runnable callback) {
+        this.onSessionClosed = callback != null ? callback : () -> {};
+    }
+
+    /**
+     * Notify the handler that the underlying transport has been torn down — invokes
+     * the {@link #setOnSessionClosed(Runnable)} hook exactly once. Safe to call from
+     * any thread; exceptions in the hook are caught and logged.
+     */
+    public void notifySessionClosed() {
+        try {
+            onSessionClosed.run();
+        } catch (RuntimeException e) {
+            log.warn("onSessionClosed hook threw: {}", e.toString());
+        } finally {
+            onSessionClosed = () -> {};   // one-shot
+        }
+    }
 
     /**
      * Wire this handler to its session's RakNet control / game callbacks. Idempotent —
@@ -144,7 +243,9 @@ public final class LoginFlowHandler {
             case AWAIT_LOGIN -> handleAwaitLogin(packet);
             case AWAIT_C2S_HANDSHAKE -> handleAwaitC2sHandshake(packet);
             case AWAIT_RESOURCE_PACK_RESPONSE -> handleAwaitResourcePackResponse(packet);
-            case INGAME -> handleIngame(packet);
+            case AWAIT_CHUNK_RADIUS_REQUEST -> handleAwaitChunkRadiusRequest(packet);
+            case AWAIT_PLAYER_INIT -> handleAwaitPlayerInit(packet);
+            case ACTIVE -> handleActive(packet);
         }
     }
 
@@ -299,10 +400,21 @@ public final class LoginFlowHandler {
             return;
         }
 
-        // Second COMPLETED: client has accepted the stack — send StartGame, the
-        // registry packets, and PlayStatus(PLAYER_SPAWN) so the client can move on.
+        // Second COMPLETED: client has accepted the stack — send StartGame and the
+        // post-StartGame registry packets. We then wait for the client's
+        // RequestChunkRadius before shipping any chunks; PlayStatus(PLAYER_SPAWN)
+        // is deferred until after the chunk burst.
         sendStartGameAndRegistries();
-        session.setState(INGAME);
+        session.setState(AWAIT_CHUNK_RADIUS_REQUEST);
+
+        // Player identity is now known and the client is past the resource-pack
+        // negotiation — fire the spawn callback so the listener can build a
+        // PlayerImpl, run PreLogin checks, and broadcast Join.
+        try {
+            onPlayerSpawn.accept(session);
+        } catch (RuntimeException e) {
+            log.warn("onPlayerSpawn hook threw for {}: {}", session.displayName(), e.toString());
+        }
     }
 
     /**
@@ -333,12 +445,12 @@ public final class LoginFlowHandler {
     /**
      * Send a real StartGame body (loaded from {@code butterfly_data/v975/start_game.bin}
      * with the player's session-specific fields patched in), followed by the
-     * post-StartGame registry packets and a {@link PlayStatusPacket#PLAYER_SPAWN}.
+     * post-StartGame registry packets.
      *
      * <p>Order matters: the client expects StartGame before any of the registry
-     * packets, and PLAYER_SPAWN after the registries. The MVP sends them all in a
-     * single batch; later we'll defer PLAYER_SPAWN until after the client has
-     * requested its initial chunks.
+     * packets. PLAYER_SPAWN is <em>not</em> sent here — it's deferred until after
+     * the chunk burst (see {@link #handleAwaitChunkRadiusRequest}) so the client
+     * doesn't render the player into the void.
      *
      * <p>Identity sources:
      * <ul>
@@ -376,19 +488,172 @@ public final class LoginFlowHandler {
         RawCapturePacket actors = new RawCapturePacket(PacketIds.AVAILABLE_ACTOR_IDENTIFIERS);
         actors.decode(Unpooled.wrappedBuffer(RegistryDataPackets.actorIdentifiers()));
 
-        PlayStatusPacket spawn = new PlayStatusPacket();
-        spawn.setStatus(PlayStatusPacket.PLAYER_SPAWN);
-
         log.info("sending StartGame + registries (uniqueId={}, runtimeId={})",
             entityUniqueId, entityRuntimeId);
-        session.sendPackets(List.of(startGame, itemRegistry, biomes, creative, recipes, actors, spawn));
+        session.sendPackets(List.of(startGame, itemRegistry, biomes, creative, recipes, actors));
     }
 
-    // ---- State 5: INGAME ----
+    // ---- State 5: AWAIT_CHUNK_RADIUS_REQUEST ----
 
-    private void handleIngame(Packet packet) {
-        // Plan B will route ingame packets to the world / player layer. For now we only
-        // log unknown packets so the rest of the test surface stays predictable.
-        log.debug("ingame packet id=0x{}", Integer.toHexString(packet.packetId()));
+    /**
+     * The client sends {@code RequestChunkRadius} (id 0x45) as soon as it's done
+     * digesting StartGame + the registry packets. The body is a single zigzag
+     * varint — the client's preferred view radius (chunks).
+     *
+     * <p>We respond with:
+     * <ol>
+     *   <li>{@code ChunkRadiusUpdated} (0x46) — the radius the server actually
+     *       allows ({@code min(requested, SERVER_MAX_CHUNK_RADIUS)}).</li>
+     *   <li>{@code NetworkChunkPublisherUpdate} (0x79) — the center + radius of
+     *       the cube of chunks we're about to send. Radius is in BLOCKS.</li>
+     *   <li>{@link #INITIAL_CHUNK_RADIUS}-sized square of {@code LevelChunk} (0x3a)
+     *       packets centered on (0,0).</li>
+     *   <li>{@code PlayStatus(PLAYER_SPAWN)} — only after the burst, so the client
+     *       has terrain to render the player into.</li>
+     * </ol>
+     */
+    private void handleAwaitChunkRadiusRequest(Packet packet) {
+        if (packet.packetId() != ID_REQUEST_CHUNK_RADIUS) {
+            log.warn("unexpected packet id 0x{} in {}",
+                Integer.toHexString(packet.packetId()), session.state());
+            return;
+        }
+        if (!(packet instanceof RawCapturePacket raw)) return;
+
+        int requestedRadius;
+        try {
+            ByteBuf body = raw.rawBody().duplicate();
+            requestedRadius = body.isReadable() ? VarInts.readInt(body) : SERVER_MAX_CHUNK_RADIUS;
+        } catch (RuntimeException e) {
+            log.warn("RequestChunkRadius parse failed: {}", e.toString());
+            requestedRadius = SERVER_MAX_CHUNK_RADIUS;
+        }
+        int negotiatedRadius = Math.min(requestedRadius, SERVER_MAX_CHUNK_RADIUS);
+        log.info("RequestChunkRadius: requested={}, granted={}", requestedRadius, negotiatedRadius);
+
+        // 1) ChunkRadiusUpdated — single packet, sent first so the client knows the cap.
+        RawCapturePacket radiusUpdated = new RawCapturePacket(ID_CHUNK_RADIUS_UPDATED);
+        radiusUpdated.decode(Unpooled.wrappedBuffer(ChunkSender.chunkRadiusUpdatedBody(negotiatedRadius)));
+        session.sendPackets(List.of(radiusUpdated));
+
+        // 2) NetworkChunkPublisherUpdate — radius is in BLOCKS, not chunks.
+        int publisherRadiusBlocks = INITIAL_CHUNK_RADIUS * 16;
+        RawCapturePacket publisher = new RawCapturePacket(ID_NETWORK_CHUNK_PUBLISHER_UPDATE);
+        publisher.decode(Unpooled.wrappedBuffer(ChunkSender.networkChunkPublisherUpdateBody(
+            SPAWN_BLOCK_X, SPAWN_BLOCK_Y, SPAWN_BLOCK_Z, publisherRadiusBlocks)));
+        session.sendPackets(List.of(publisher));
+
+        // 3) LevelChunk burst — 5×5 around (0,0). loadChunk is sync; for the MVP we
+        // accept blocking the simulate thread for ~25 chunk reads from LevelDB.
+        sendChunkBurst();
+
+        // 4) PlayStatus(PLAYER_SPAWN) — finally tell the client they can spawn.
+        PlayStatusPacket spawn = new PlayStatusPacket();
+        spawn.setStatus(PlayStatusPacket.PLAYER_SPAWN);
+        session.sendPackets(List.of(spawn));
+
+        session.setState(AWAIT_PLAYER_INIT);
+    }
+
+    /**
+     * Encode and ship one {@code LevelChunk} packet per chunk in an
+     * {@code (2*INITIAL_CHUNK_RADIUS + 1)} square around (0,0). If the world
+     * doesn't have a chunk at a given coord (loadChunk produced no data), we
+     * synthesize an all-air chunk with no backing world so the client still
+     * gets terrain bytes for that slot.
+     *
+     * <p>Each chunk is sent as its own batch — easier to reason about than
+     * coalescing 25 chunks into a single batch, and the codec will still
+     * compress each batch.
+     */
+    private void sendChunkBurst() {
+        if (world == null) {
+            log.warn("no world wired into LoginFlowHandler — skipping chunk burst");
+            return;
+        }
+        int dim = world.dim();
+        int radius = INITIAL_CHUNK_RADIUS;
+        List<Packet> burst = new ArrayList<>((2 * radius + 1) * (2 * radius + 1));
+        for (int cx = -radius; cx <= radius; cx++) {
+            for (int cz = -radius; cz <= radius; cz++) {
+                world.loadChunk(cx, cz);
+                Chunk chunk = world.getChunk(cx, cz);
+                if (chunk == null) chunk = airChunk(cx, cz, dim);
+                byte[] body = ChunkSender.levelChunkBody(chunk, dim);
+                RawCapturePacket pkt = new RawCapturePacket(PacketIds.LEVEL_CHUNK);
+                pkt.decode(Unpooled.wrappedBuffer(body));
+                burst.add(pkt);
+            }
+        }
+        log.info("sending {} LevelChunk packets around spawn (radius={})",
+            burst.size(), radius);
+        session.sendPackets(burst);
+    }
+
+    /**
+     * Build a worldless all-air {@link Chunk} for {@code (cx, cz)} — used when
+     * the world has no entry at that coord and we still need to emit a
+     * LevelChunk so the client doesn't see void.
+     */
+    private static Chunk airChunk(int cx, int cz, int dim) {
+        SubChunk[] subs = new SubChunk[Chunk.SUBCHUNK_COUNT];
+        for (int i = 0; i < subs.length; i++) {
+            subs[i] = SubChunk.empty(Chunk.MIN_SUB_Y + i);
+        }
+        return new Chunk(/* world = */ null, cx, cz, dim, subs);
+    }
+
+    // ---- State 6: AWAIT_PLAYER_INIT ----
+
+    /**
+     * The client confirms it has consumed the chunk burst and finished its
+     * loading screen by sending {@code SetLocalPlayerAsInitialised} (id 0x71).
+     * The body is a single varuint runtime entity id; we don't need it — the
+     * arrival alone is the signal to flip to {@link ClientSession.LoginState#ACTIVE}.
+     */
+    private void handleAwaitPlayerInit(Packet packet) {
+        if (packet.packetId() != ID_SET_LOCAL_PLAYER_AS_INITIALISED) {
+            log.debug("waiting for SetLocalPlayerAsInitialised; got 0x{}",
+                Integer.toHexString(packet.packetId()));
+            return;
+        }
+        log.info("player ready: {}", session.displayName());
+        session.setState(ACTIVE);
+    }
+
+    // ---- State 7: ACTIVE ----
+
+    /**
+     * Optional chat-routing hook installed by {@link ButterflyServer} so the login flow
+     * can hand off inbound {@code Text} (0x09) packets without depending on the core
+     * server class directly. The hook receives the player's display name and the
+     * inbound chat message; the listener fires {@code PlayerChatEvent} and broadcasts
+     * to other online players if the event isn't cancelled.
+     */
+    private java.util.function.BiConsumer<String, String> onChat = (n, m) -> {};
+
+    /** Install the chat-routing hook. Pass {@code null} to clear. */
+    public void setOnChat(java.util.function.BiConsumer<String, String> handler) {
+        this.onChat = handler != null ? handler : (n, m) -> {};
+    }
+
+    private void handleActive(Packet packet) {
+        if (packet.packetId() == PacketIds.TEXT && packet instanceof TextPacket text) {
+            // Re-broadcast chat from the client. We use the server-known displayName
+            // (captured during login) rather than the packet's sourceName so a client
+            // can't spoof other usernames.
+            String message = text.message();
+            if (message == null || message.isEmpty()) return;
+            try {
+                onChat.accept(session.displayName(), message);
+            } catch (RuntimeException e) {
+                log.warn("chat hook threw for {}: {}", session.displayName(), e.toString());
+            }
+            return;
+        }
+        // Plan B will route remaining active packets to the world / player layer. For
+        // now we only log unknown packets so the rest of the test surface stays
+        // predictable.
+        log.debug("active packet id=0x{}", Integer.toHexString(packet.packetId()));
     }
 }

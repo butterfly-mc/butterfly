@@ -38,7 +38,20 @@ public final class ClientSession {
         AWAIT_LOGIN,
         AWAIT_C2S_HANDSHAKE,
         AWAIT_RESOURCE_PACK_RESPONSE,
-        INGAME
+        /**
+         * Sat after StartGame + the registry packets have been sent. The client now
+         * sends {@code RequestChunkRadius} (0x45); we reply with
+         * {@code ChunkRadiusUpdated}, ship the chunk burst around spawn, and then
+         * fire {@code PlayStatus(PLAYER_SPAWN)}.
+         */
+        AWAIT_CHUNK_RADIUS_REQUEST,
+        /**
+         * Chunks have been sent and {@code PlayStatus(PLAYER_SPAWN)} has gone out;
+         * waiting for the client's {@code SetLocalPlayerAsInitialised} (0x71).
+         */
+        AWAIT_PLAYER_INIT,
+        /** Player is fully spawned in and the simulation can dispatch packets to gameplay logic. */
+        ACTIVE
     }
 
     private final RakSession rak;
