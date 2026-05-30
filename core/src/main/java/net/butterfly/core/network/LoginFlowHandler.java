@@ -23,6 +23,7 @@ import org.slf4j.LoggerFactory;
 import java.security.KeyPair;
 import java.util.Base64;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static net.butterfly.core.network.ClientSession.LoginState.AWAIT_C2S_HANDSHAKE;
 import static net.butterfly.core.network.ClientSession.LoginState.AWAIT_LOGIN;
@@ -60,6 +61,9 @@ import static net.butterfly.core.network.ClientSession.LoginState.INGAME;
  */
 public final class LoginFlowHandler {
     private static final Logger log = LoggerFactory.getLogger(LoginFlowHandler.class);
+
+    /** Server-wide entity runtime id allocator. Player 1 gets 1, etc. */
+    private static final AtomicLong RUNTIME_ID_SEQ = new AtomicLong(0L);
 
     /** Server identity shared across all sessions — generated once at startup. */
     public record ServerIdentity(KeyPair keyPair) {
@@ -295,8 +299,9 @@ public final class LoginFlowHandler {
             return;
         }
 
-        // Second COMPLETED: client has accepted the stack — send StartGame and go ingame.
-        sendStartGamePlaceholder();
+        // Second COMPLETED: client has accepted the stack — send StartGame, the
+        // registry packets, and PlayStatus(PLAYER_SPAWN) so the client can move on.
+        sendStartGameAndRegistries();
         session.setState(INGAME);
     }
 
@@ -326,18 +331,57 @@ public final class LoginFlowHandler {
     }
 
     /**
-     * Send a placeholder StartGame body. The client will reject it and disconnect — that's
-     * expected for the MVP. Plan B replaces this with a real, parameterized body loaded
-     * from the captured BDS template.
+     * Send a real StartGame body (loaded from {@code butterfly_data/v975/start_game.bin}
+     * with the player's session-specific fields patched in), followed by the
+     * post-StartGame registry packets and a {@link PlayStatusPacket#PLAYER_SPAWN}.
      *
-     * <p>TODO: load StartGame template from butterfly-data/v975/start_game.bin and patch
-     * in playerPosition/entityRuntimeId.
+     * <p>Order matters: the client expects StartGame before any of the registry
+     * packets, and PLAYER_SPAWN after the registries. The MVP sends them all in a
+     * single batch; later we'll defer PLAYER_SPAWN until after the client has
+     * requested its initial chunks.
+     *
+     * <p>Identity sources:
+     * <ul>
+     *   <li>{@code entityUniqueId}  — derived from the client's identity public key
+     *       hashCode for stability across reconnects within a process.</li>
+     *   <li>{@code entityRuntimeId} — pulled from a process-wide
+     *       {@link AtomicLong}; the first joining player gets 1.</li>
+     *   <li>spawn position — fixed {@code (0, 100, 0)} until we have a world.</li>
+     * </ul>
      */
-    private void sendStartGamePlaceholder() {
+    private void sendStartGameAndRegistries() {
+        long entityUniqueId = session.clientIdentityKey() != null
+            ? session.clientIdentityKey().hashCode()
+            : System.nanoTime();
+        long entityRuntimeId = RUNTIME_ID_SEQ.incrementAndGet();
+
+        byte[] startGameBody = StartGameTemplate.withDynamicFields(
+            entityUniqueId, entityRuntimeId, 0f, 100f, 0f);
+
         RawCapturePacket startGame = new RawCapturePacket(PacketIds.START_GAME);
-        byte[] placeholder = new byte[1024];   // 1KB of zero bytes — known-bad, see TODO above.
-        startGame.decode(Unpooled.wrappedBuffer(placeholder));
-        session.sendPackets(List.of(startGame));
+        startGame.decode(Unpooled.wrappedBuffer(startGameBody));
+
+        RawCapturePacket itemRegistry = new RawCapturePacket(PacketIds.ITEM_REGISTRY);
+        itemRegistry.decode(Unpooled.wrappedBuffer(RegistryDataPackets.itemRegistry()));
+
+        RawCapturePacket biomes = new RawCapturePacket(PacketIds.BIOME_DEFINITION_LIST);
+        biomes.decode(Unpooled.wrappedBuffer(RegistryDataPackets.biomeDefinitions()));
+
+        RawCapturePacket creative = new RawCapturePacket(PacketIds.CREATIVE_CONTENT);
+        creative.decode(Unpooled.wrappedBuffer(RegistryDataPackets.creativeContent()));
+
+        RawCapturePacket recipes = new RawCapturePacket(PacketIds.CRAFTING_DATA);
+        recipes.decode(Unpooled.wrappedBuffer(RegistryDataPackets.craftingData()));
+
+        RawCapturePacket actors = new RawCapturePacket(PacketIds.AVAILABLE_ACTOR_IDENTIFIERS);
+        actors.decode(Unpooled.wrappedBuffer(RegistryDataPackets.actorIdentifiers()));
+
+        PlayStatusPacket spawn = new PlayStatusPacket();
+        spawn.setStatus(PlayStatusPacket.PLAYER_SPAWN);
+
+        log.info("sending StartGame + registries (uniqueId={}, runtimeId={})",
+            entityUniqueId, entityRuntimeId);
+        session.sendPackets(List.of(startGame, itemRegistry, biomes, creative, recipes, actors, spawn));
     }
 
     // ---- State 5: INGAME ----

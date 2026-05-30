@@ -6,6 +6,8 @@ import net.butterfly.api.world.BlockState;
 import net.butterfly.api.world.World;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Objects;
 
 /**
@@ -174,6 +176,18 @@ public final class WorldImpl implements World {
             for (Chunk chunk : loadedChunks.values()) {
                 if (chunk.isDirty()) saveChunk(chunk);
             }
+        }
+    }
+
+    /**
+     * Returns a snapshot of currently loaded chunks. Used by
+     * {@link net.butterfly.core.tick.WorldSnapshotPublisher} (and other internal
+     * tick-thread consumers) to capture per-tick world snapshots; not part of the
+     * public {@code World} contract.
+     */
+    public Collection<Chunk> loadedChunks() {
+        synchronized (loadedChunks) {
+            return new ArrayList<>(loadedChunks.values());
         }
     }
 
