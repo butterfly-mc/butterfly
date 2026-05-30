@@ -153,8 +153,10 @@ public final class ButterflyServer implements Server {
     }
 
     private void onSessionCreated(ClientSession session) {
-        // Construct the login handler — its constructor wires session.onPackets(...).
+        // Construct the login handler. Its constructor only stores refs — the actual
+        // RakSession + ClientSession callbacks are wired by attach() below.
         LoginFlowHandler login = new LoginFlowHandler(session, serverIdentity, defaultWorld);
+        login.attach();
 
         // Once the handshake captures displayName + xuid (right before AWAIT_CHUNK_RADIUS_REQUEST),
         // build the PlayerImpl, run PreLogin checks, register them in the online roster and

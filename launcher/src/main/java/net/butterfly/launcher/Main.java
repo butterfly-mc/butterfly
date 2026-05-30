@@ -49,12 +49,22 @@ public final class Main {
     }
 
     private static void runConsole(ButterflyServer server, AtomicBoolean stopped) {
+        // No interactive TTY (e.g. server launched via `java -jar` redirected from /dev/null,
+        // systemd, docker without -it, or a bash subshell) — don't try to read commands; just
+        // block until the JVM shutdown hook fires.
+        if (System.console() == null) {
+            log.info("No interactive console (stdin is not a TTY) — running headless. Send SIGTERM/SIGINT to stop.");
+            while (!stopped.get()) {
+                try { Thread.sleep(1000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+            }
+            return;
+        }
+
         Terminal terminal;
         try {
             terminal = TerminalBuilder.builder().system(true).dumb(true).build();
         } catch (IOException e) {
             log.warn("Could not initialise terminal — running without interactive console: {}", e.toString());
-            // Block until shutdown hook fires
             while (!stopped.get()) {
                 try { Thread.sleep(1000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
             }

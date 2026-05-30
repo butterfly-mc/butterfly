@@ -104,6 +104,7 @@ public final class ConnectionManager {
             if (!in.isReadable()) return;
             int id = in.getUnsignedByte(in.readerIndex());
             InetSocketAddress sender = pkt.sender();
+            log.info("rx {} bytes id=0x{} from {}", in.readableBytes(), Integer.toHexString(id), sender);
 
             switch (id) {
                 case RakConstants.ID_UNCONNECTED_PING -> { handlePing(ctx, pkt); return; }
@@ -119,7 +120,11 @@ public final class ConnectionManager {
             }
 
             ClientSession session = sessions.get(sender);
-            if (session != null) session.rak().handleDatagram(in.retain());
+            if (session != null) {
+                session.rak().handleDatagram(in.retain());
+            } else {
+                log.warn("no session for {} (id=0x{}) — dropping {} bytes", sender, Integer.toHexString(id), in.readableBytes());
+            }
         }
 
         private void handlePing(ChannelHandlerContext ctx, DatagramPacket pkt) {

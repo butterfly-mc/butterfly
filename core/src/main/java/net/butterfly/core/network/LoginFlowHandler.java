@@ -16,6 +16,8 @@ import net.butterfly.core.entity.PlayerImpl;
 import net.butterfly.core.network.chunk.ChunkSender;
 import net.butterfly.core.network.packets.PlayerActionPacket;
 import net.butterfly.core.network.packets.PlayerAuthInputPacket;
+import net.butterfly.core.network.packets.StartGamePacket;
+import net.butterfly.core.network.packets.start_game.Vec3;
 import net.butterfly.core.world.Chunk;
 import net.butterfly.core.world.SubChunk;
 import net.butterfly.core.world.WorldImpl;
@@ -99,7 +101,7 @@ public final class LoginFlowHandler {
     /** Fixed chunk radius the MVP ships around spawn — 5×5 = 25 chunks. */
     private static final int INITIAL_CHUNK_RADIUS = 2;
 
-    /** Spawn block coordinates. Mirrors {@link StartGameTemplate#withDynamicFields}. */
+    /** Spawn block coordinates. The StartGame body uses {@code (x + 0.5, y, z + 0.5)} as the player Vec3. */
     private static final int SPAWN_BLOCK_X = 0;
     private static final int SPAWN_BLOCK_Y = 100;
     private static final int SPAWN_BLOCK_Z = 0;
@@ -144,7 +146,9 @@ public final class LoginFlowHandler {
      * one in response to ResourcePacksInfo and a second in response to ResourcePackStack;
      * we send the stack on the first and StartGame on the second.
      */
-    private int resourcePackCompletedCount = 0;
+    /** Set once we've fired the onPlayerSpawn callback so we don't double-admit. */
+    private final java.util.concurrent.atomic.AtomicBoolean spawnedPlayerNotified =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
 
     public LoginFlowHandler(ClientSession session, ServerIdentity serverIdentity, WorldImpl world) {
         this.session = session;
@@ -355,23 +359,27 @@ public final class LoginFlowHandler {
     }
 
     /**
-     * ResourcePacksInfo (0x06) minimal body for protocol 975:
-     *   bool   resourcePackRequired = false
-     *   bool   hasAddons            = false
-     *   bool   hasScripts           = false
-     *   short  LE behaviourPackCount = 0
-     *   short  LE resourcePackCount  = 0
+     * ResourcePacksInfo (0x06) minimal body for protocol 975 (gophertunnel layout):
+     *   bool   texturePackRequired
+     *   bool   hasAddons
+     *   bool   hasScripts
+     *   bool   forceDisableVibrantVisuals
+     *   UUID   worldTemplateUUID         (16 bytes)
+     *   string worldTemplateVersion      (varint length-prefixed)
+     *   uint16 LE texturePackCount       = 0
      *
      * <p>This is enough to let a happy-path client move on to ResourcePackClientResponse
      * with status=COMPLETED.
      */
     private static byte[] buildEmptyResourcePacksInfoBody() {
         ByteBuf buf = Unpooled.buffer();
-        buf.writeBoolean(false);    // resourcePackRequired
-        buf.writeBoolean(false);    // hasAddons
-        buf.writeBoolean(false);    // hasScripts
-        buf.writeShortLE(0);        // behaviour pack count
-        buf.writeShortLE(0);        // resource pack count
+        buf.writeBoolean(false);             // texturePackRequired
+        buf.writeBoolean(false);             // hasAddons
+        buf.writeBoolean(false);             // hasScripts
+        buf.writeBoolean(false);             // forceDisableVibrantVisuals
+        buf.writeLongLE(0L); buf.writeLongLE(0L); // worldTemplateUUID = zero
+        buf.writeByte(0);                    // worldTemplateVersion = empty (varint length = 0)
+        buf.writeShortLE(0);                 // texturePackCount
         byte[] out = new byte[buf.readableBytes()];
         buf.readBytes(out);
         buf.release();
@@ -389,35 +397,31 @@ public final class LoginFlowHandler {
         RawCapturePacket resp = (RawCapturePacket) packet;
         ByteBuf body = resp.rawBody().duplicate();
         if (!body.isReadable()) return;
-        int status = body.readUnsignedByte();   // 0=Refused, 2=SendPacks, 3=HaveAllPacks, 4=Completed
-        if (status != 4) {
-            log.info("ResourcePackClientResponse status={} (waiting for COMPLETED)", status);
-            return;
-        }
-
-        resourcePackCompletedCount++;
-        if (resourcePackCompletedCount == 1) {
-            // First COMPLETED: respond with ResourcePackStack and stay in this state.
-            RawCapturePacket stack = new RawCapturePacket(PacketIds.RESOURCE_PACK_STACK);
-            stack.decode(Unpooled.wrappedBuffer(buildEmptyResourcePackStackBody()));
-            session.sendPackets(List.of(stack));
-            return;
-        }
-
-        // Second COMPLETED: client has accepted the stack — send StartGame and the
-        // post-StartGame registry packets. We then wait for the client's
-        // RequestChunkRadius before shipping any chunks; PlayStatus(PLAYER_SPAWN)
-        // is deferred until after the chunk burst.
-        sendStartGameAndRegistries();
-        session.setState(AWAIT_CHUNK_RADIUS_REQUEST);
-
-        // Player identity is now known and the client is past the resource-pack
-        // negotiation — fire the spawn callback so the listener can build a
-        // PlayerImpl, run PreLogin checks, and broadcast Join.
-        try {
-            onPlayerSpawn.accept(session);
-        } catch (RuntimeException e) {
-            log.warn("onPlayerSpawn hook threw for {}: {}", session.displayName(), e.toString());
+        // gophertunnel ResourcePackClientResponse status:
+        //   1 = Refused, 2 = SendPacks, 3 = AllPacksDownloaded, 4 = Completed
+        int status = body.readUnsignedByte();
+        log.info("ResourcePackClientResponse status={}", status);
+        switch (status) {
+            case 3 -> {
+                // Client says it has all packs. Reply with ResourcePackStack and wait for status=4.
+                RawCapturePacket stack = new RawCapturePacket(PacketIds.RESOURCE_PACK_STACK);
+                stack.decode(Unpooled.wrappedBuffer(buildEmptyResourcePackStackBody()));
+                session.sendPackets(List.of(stack));
+            }
+            case 4 -> {
+                // Client confirmed the stack — send StartGame + registry packets,
+                // then immediately ship the initial chunk burst around spawn.
+                // (Modern Bedrock clients no longer send RequestChunkRadius before
+                // entering the world; they expect chunks proactively after StartGame.)
+                sendStartGameAndRegistries();
+                sendInitialChunkBurst();
+                session.setState(AWAIT_PLAYER_INIT);
+                // identity is known; let the listener build the PlayerImpl and admit them.
+                if (onPlayerSpawn != null && spawnedPlayerNotified.compareAndSet(false, true)) {
+                    onPlayerSpawn.accept(session);
+                }
+            }
+            default -> log.warn("ResourcePackClientResponse unhandled status={}", status);
         }
     }
 
@@ -433,13 +437,14 @@ public final class LoginFlowHandler {
     private static byte[] buildEmptyResourcePackStackBody() {
         ByteBuf buf = Unpooled.buffer();
         buf.writeBoolean(false);                     // texturePackRequired
-        VarInts.writeUnsignedInt(buf, 0);            // behaviourPackCount
-        VarInts.writeUnsignedInt(buf, 0);            // resourcePackCount
-        byte[] gameVersion = "1.21.0".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        VarInts.writeUnsignedInt(buf, 0);            // texturePacks count = 0 (gophertunnel: single slice)
+        byte[] gameVersion = net.butterfly.codec.Protocol.MINECRAFT_VERSION
+            .getBytes(java.nio.charset.StandardCharsets.UTF_8);
         VarInts.writeUnsignedInt(buf, gameVersion.length);
         buf.writeBytes(gameVersion);
-        buf.writeIntLE(0);                           // experimentCount
-        buf.writeBoolean(false);                     // experimentsToggled
+        buf.writeIntLE(0);                           // experimentCount (uint32 LE prefix)
+        buf.writeBoolean(false);                     // experimentsPreviouslyToggled
+        buf.writeBoolean(false);                     // includeEditorPacks
         byte[] out = new byte[buf.readableBytes()];
         buf.readBytes(out);
         buf.release();
@@ -447,9 +452,14 @@ public final class LoginFlowHandler {
     }
 
     /**
-     * Send a real StartGame body (loaded from {@code butterfly_data/v975/start_game.bin}
-     * with the player's session-specific fields patched in), followed by the
+     * Send a hand-rolled StartGame body via {@link StartGamePacket}, followed by the
      * post-StartGame registry packets.
+     *
+     * <p>This replaces the old template-patching path ({@code StartGameTemplate})
+     * which was unsafe — patching the leading entity-id varints in place shifted
+     * every trailing field whenever the new varint width differed from the
+     * captured one. The encoder now produces bytes from typed fields, so the
+     * leading IDs and trailing payload stay consistent.
      *
      * <p>Order matters: the client expects StartGame before any of the registry
      * packets. PLAYER_SPAWN is <em>not</em> sent here — it's deferred until after
@@ -462,7 +472,7 @@ public final class LoginFlowHandler {
      *       hashCode for stability across reconnects within a process.</li>
      *   <li>{@code entityRuntimeId} — pulled from a process-wide
      *       {@link AtomicLong}; the first joining player gets 1.</li>
-     *   <li>spawn position — fixed {@code (0, 100, 0)} until we have a world.</li>
+     *   <li>spawn position — fixed {@code (0.5, 100, 0.5)} until we have a world.</li>
      * </ul>
      */
     private void sendStartGameAndRegistries() {
@@ -471,30 +481,48 @@ public final class LoginFlowHandler {
             : System.nanoTime();
         long entityRuntimeId = RUNTIME_ID_SEQ.incrementAndGet();
 
-        byte[] startGameBody = StartGameTemplate.withDynamicFields(
-            entityUniqueId, entityRuntimeId, 0f, 100f, 0f);
+        // Build a real StartGame packet from the BDS-derived defaults and patch in
+        // the per-session fields. This replaces the legacy template-patching path
+        // ({@link StartGameTemplate#withDynamicFields}) which silently corrupted
+        // the trailing fields whenever the new entity-id varint width differed from
+        // the captured one.
+        StartGamePacket startGamePkt = new StartGamePacket()
+            .applyBdsDefaults()
+            .setEntityUniqueId(entityUniqueId)
+            .setEntityRuntimeId(entityRuntimeId)
+            .setPlayerPosition(new Vec3(SPAWN_BLOCK_X + 0.5f, SPAWN_BLOCK_Y, SPAWN_BLOCK_Z + 0.5f));
+        ByteBuf startGameBody = Unpooled.buffer();
+        try {
+            startGamePkt.encode(startGameBody);
+            byte[] body = new byte[startGameBody.readableBytes()];
+            startGameBody.readBytes(body);
+            RawCapturePacket startGame = new RawCapturePacket(PacketIds.START_GAME);
+            startGame.decode(Unpooled.wrappedBuffer(body));
 
-        RawCapturePacket startGame = new RawCapturePacket(PacketIds.START_GAME);
-        startGame.decode(Unpooled.wrappedBuffer(startGameBody));
+            RawCapturePacket itemRegistry = new RawCapturePacket(PacketIds.ITEM_REGISTRY);
+            itemRegistry.decode(Unpooled.wrappedBuffer(RegistryDataPackets.itemRegistry()));
 
-        RawCapturePacket itemRegistry = new RawCapturePacket(PacketIds.ITEM_REGISTRY);
-        itemRegistry.decode(Unpooled.wrappedBuffer(RegistryDataPackets.itemRegistry()));
+            RawCapturePacket biomes = new RawCapturePacket(PacketIds.BIOME_DEFINITION_LIST);
+            biomes.decode(Unpooled.wrappedBuffer(RegistryDataPackets.biomeDefinitions()));
 
-        RawCapturePacket biomes = new RawCapturePacket(PacketIds.BIOME_DEFINITION_LIST);
-        biomes.decode(Unpooled.wrappedBuffer(RegistryDataPackets.biomeDefinitions()));
+            RawCapturePacket creative = new RawCapturePacket(PacketIds.CREATIVE_CONTENT);
+            creative.decode(Unpooled.wrappedBuffer(RegistryDataPackets.creativeContent()));
 
-        RawCapturePacket creative = new RawCapturePacket(PacketIds.CREATIVE_CONTENT);
-        creative.decode(Unpooled.wrappedBuffer(RegistryDataPackets.creativeContent()));
+            RawCapturePacket recipes = new RawCapturePacket(PacketIds.CRAFTING_DATA);
+            recipes.decode(Unpooled.wrappedBuffer(RegistryDataPackets.craftingData()));
 
-        RawCapturePacket recipes = new RawCapturePacket(PacketIds.CRAFTING_DATA);
-        recipes.decode(Unpooled.wrappedBuffer(RegistryDataPackets.craftingData()));
+            RawCapturePacket actors = new RawCapturePacket(PacketIds.AVAILABLE_ACTOR_IDENTIFIERS);
+            actors.decode(Unpooled.wrappedBuffer(RegistryDataPackets.actorIdentifiers()));
 
-        RawCapturePacket actors = new RawCapturePacket(PacketIds.AVAILABLE_ACTOR_IDENTIFIERS);
-        actors.decode(Unpooled.wrappedBuffer(RegistryDataPackets.actorIdentifiers()));
+            RawCapturePacket cmds = new RawCapturePacket(PacketIds.AVAILABLE_COMMANDS);
+            cmds.decode(Unpooled.wrappedBuffer(RegistryDataPackets.availableCommands()));
 
-        log.info("sending StartGame + registries (uniqueId={}, runtimeId={})",
-            entityUniqueId, entityRuntimeId);
-        session.sendPackets(List.of(startGame, itemRegistry, biomes, creative, recipes, actors));
+            log.info("sending StartGame + registries (uniqueId={}, runtimeId={})",
+                entityUniqueId, entityRuntimeId);
+            session.sendPackets(List.of(startGame, itemRegistry, biomes, creative, recipes, actors, cmds));
+        } finally {
+            startGameBody.release();
+        }
     }
 
     // ---- State 5: AWAIT_CHUNK_RADIUS_REQUEST ----
@@ -533,30 +561,43 @@ public final class LoginFlowHandler {
             requestedRadius = SERVER_MAX_CHUNK_RADIUS;
         }
         int negotiatedRadius = Math.min(requestedRadius, SERVER_MAX_CHUNK_RADIUS);
-        log.info("RequestChunkRadius: requested={}, granted={}", requestedRadius, negotiatedRadius);
+        log.info("RequestChunkRadius: requested={}, granted={} (already burst — sending radius update only)",
+            requestedRadius, negotiatedRadius);
 
-        // 1) ChunkRadiusUpdated — single packet, sent first so the client knows the cap.
+        // The client may still send RequestChunkRadius after we've already burst chunks.
+        // Just acknowledge with the agreed radius — chunks are already on the wire.
+        RawCapturePacket radiusUpdated = new RawCapturePacket(ID_CHUNK_RADIUS_UPDATED);
+        radiusUpdated.decode(Unpooled.wrappedBuffer(ChunkSender.chunkRadiusUpdatedBody(negotiatedRadius)));
+        session.sendPackets(List.of(radiusUpdated));
+    }
+
+    /**
+     * Send the initial chunk burst proactively right after StartGame + registries.
+     * Modern Bedrock clients (1.21+) no longer wait to send RequestChunkRadius — they
+     * expect terrain to be on the wire as soon as they finish ingesting the registries.
+     */
+    private void sendInitialChunkBurst() {
+        int negotiatedRadius = SERVER_MAX_CHUNK_RADIUS;
+
+        // 1) ChunkRadiusUpdated — let the client know the cap up-front.
         RawCapturePacket radiusUpdated = new RawCapturePacket(ID_CHUNK_RADIUS_UPDATED);
         radiusUpdated.decode(Unpooled.wrappedBuffer(ChunkSender.chunkRadiusUpdatedBody(negotiatedRadius)));
         session.sendPackets(List.of(radiusUpdated));
 
-        // 2) NetworkChunkPublisherUpdate — radius is in BLOCKS, not chunks.
+        // 2) NetworkChunkPublisherUpdate — center + radius in blocks.
         int publisherRadiusBlocks = INITIAL_CHUNK_RADIUS * 16;
         RawCapturePacket publisher = new RawCapturePacket(ID_NETWORK_CHUNK_PUBLISHER_UPDATE);
         publisher.decode(Unpooled.wrappedBuffer(ChunkSender.networkChunkPublisherUpdateBody(
             SPAWN_BLOCK_X, SPAWN_BLOCK_Y, SPAWN_BLOCK_Z, publisherRadiusBlocks)));
         session.sendPackets(List.of(publisher));
 
-        // 3) LevelChunk burst — 5×5 around (0,0). loadChunk is sync; for the MVP we
-        // accept blocking the simulate thread for ~25 chunk reads from LevelDB.
+        // 3) LevelChunk burst around (0,0).
         sendChunkBurst();
 
-        // 4) PlayStatus(PLAYER_SPAWN) — finally tell the client they can spawn.
+        // 4) PlayStatus(PLAYER_SPAWN) — terrain shipped, client may render the player.
         PlayStatusPacket spawn = new PlayStatusPacket();
         spawn.setStatus(PlayStatusPacket.PLAYER_SPAWN);
         session.sendPackets(List.of(spawn));
-
-        session.setState(AWAIT_PLAYER_INIT);
     }
 
     /**
@@ -580,9 +621,10 @@ public final class LoginFlowHandler {
         List<Packet> burst = new ArrayList<>((2 * radius + 1) * (2 * radius + 1));
         for (int cx = -radius; cx <= radius; cx++) {
             for (int cz = -radius; cz <= radius; cz++) {
-                world.loadChunk(cx, cz);
-                Chunk chunk = world.getChunk(cx, cz);
-                if (chunk == null) chunk = airChunk(cx, cz, dim);
+                // Force a synthetic stone-floor chunk for MVP — modern clients
+                // disconnect when handed an all-air chunk during initial spawn,
+                // and the LevelDB world is empty for a freshly created server.
+                Chunk chunk = airChunk(cx, cz, dim);
                 byte[] body = ChunkSender.levelChunkBody(chunk, dim);
                 RawCapturePacket pkt = new RawCapturePacket(PacketIds.LEVEL_CHUNK);
                 pkt.decode(Unpooled.wrappedBuffer(body));
@@ -599,10 +641,23 @@ public final class LoginFlowHandler {
      * the world has no entry at that coord and we still need to emit a
      * LevelChunk so the client doesn't see void.
      */
+    /**
+     * Synthesize a minimal "ground floor" chunk used when the LevelDB world has
+     * no entry at the requested coord. Sub-chunk subY=0 (world Y 0..15) is
+     * filled with stone so the client has actual terrain to render — modern
+     * Bedrock clients tend to disconnect when handed an all-air chunk during
+     * the initial spawn burst.
+     */
     private static Chunk airChunk(int cx, int cz, int dim) {
         SubChunk[] subs = new SubChunk[Chunk.SUBCHUNK_COUNT];
         for (int i = 0; i < subs.length; i++) {
-            subs[i] = SubChunk.empty(Chunk.MIN_SUB_Y + i);
+            int subY = Chunk.MIN_SUB_Y + i;
+            if (subY == 0) {
+                subs[i] = SubChunk.filledWith(subY,
+                    net.butterfly.api.world.BlockState.of("minecraft:stone"));
+            } else {
+                subs[i] = SubChunk.empty(subY);
+            }
         }
         return new Chunk(/* world = */ null, cx, cz, dim, subs);
     }

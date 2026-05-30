@@ -62,6 +62,14 @@ public final class RegistryDataPackets {
         return local;
     }
 
+    /** AvailableCommands body (packet id 0x4c). MVP: lift the BDS capture verbatim. */
+    public static byte[] availableCommands() {
+        byte[] local = availableCommands;
+        if (local == null) availableCommands = local = loadResource("available_commands.bin");
+        return local;
+    }
+    private static volatile byte[] availableCommands;
+
     private static byte[] loadResource(String name) {
         String path = BASE + name;
         try (InputStream in = RegistryDataPackets.class.getResourceAsStream(path)) {
