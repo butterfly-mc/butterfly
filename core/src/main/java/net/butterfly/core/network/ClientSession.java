@@ -94,6 +94,12 @@ public final class ClientSession {
     public String xuid() { return xuid; }
     public void setXuid(String v) { this.xuid = v; }
 
+    /** Stable UUID derived from XUID (or displayName fallback for offline). */
+    public java.util.UUID playerUuid() {
+        String seed = (xuid != null && !xuid.isEmpty()) ? "xuid:" + xuid : "name:" + displayName;
+        return java.util.UUID.nameUUIDFromBytes(seed.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
     public java.security.PublicKey clientIdentityKey() { return clientIdentityKey; }
     public void setClientIdentityKey(java.security.PublicKey k) { this.clientIdentityKey = k; }
 

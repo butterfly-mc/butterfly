@@ -16,6 +16,7 @@ import net.butterfly.core.entity.PlayerImpl;
 import net.butterfly.core.network.chunk.ChunkSender;
 import net.butterfly.core.network.packets.PlayerActionPacket;
 import net.butterfly.core.network.packets.PlayerAuthInputPacket;
+import net.butterfly.core.network.packets.PlayerListBuilder;
 import net.butterfly.core.network.packets.StartGamePacket;
 import net.butterfly.core.network.packets.start_game.Vec3;
 import net.butterfly.core.world.Chunk;
@@ -112,6 +113,16 @@ public final class LoginFlowHandler {
     private static final int ID_CHUNK_RADIUS_UPDATED = 0x46;
     private static final int ID_NETWORK_CHUNK_PUBLISHER_UPDATE = 0x79;
     private static final int ID_SET_LOCAL_PLAYER_AS_INITIALISED = 0x71;
+    private static final int ID_CLIENT_CACHE_STATUS = 0x81;
+    private static final int ID_SERVER_BOUND_LOADING_SCREEN = 0x138;
+    private static final int ID_NETWORK_STACK_LATENCY = 0x9c;
+
+    /** Packets the client sends that we safely ignore during login. */
+    private static boolean isIgnorable(int packetId) {
+        return packetId == ID_CLIENT_CACHE_STATUS
+            || packetId == ID_SERVER_BOUND_LOADING_SCREEN
+            || packetId == ID_NETWORK_STACK_LATENCY;
+    }
 
     /** Server identity shared across all sessions — generated once at startup. */
     public record ServerIdentity(KeyPair keyPair) {
@@ -242,7 +253,10 @@ public final class LoginFlowHandler {
 
     /** Receive a fully-decoded batch and dispatch each packet through the state machine. */
     public void handleInboundPackets(List<Packet> packets) {
-        for (Packet packet : packets) handleInboundPacket(packet);
+        for (Packet packet : packets) {
+            if (isIgnorable(packet.packetId())) continue;
+            handleInboundPacket(packet);
+        }
     }
 
     private void handleInboundPacket(Packet packet) {
@@ -594,7 +608,16 @@ public final class LoginFlowHandler {
         // 3) LevelChunk burst around (0,0).
         sendChunkBurst();
 
-        // 4) PlayStatus(PLAYER_SPAWN) — terrain shipped, client may render the player.
+        // 4) PlayerList Add — client needs to know about itself before rendering.
+        long uid = RUNTIME_ID_SEQ.get(); // last assigned runtime id = this player's
+        byte[] playerListBody = PlayerListBuilder.buildAdd(
+            session.playerUuid(), uid, session.displayName(),
+            session.xuid() != null ? session.xuid() : "");
+        RawCapturePacket playerList = new RawCapturePacket(0x3f); // IDPlayerList
+        playerList.decode(Unpooled.wrappedBuffer(playerListBody));
+        session.sendPackets(List.of(playerList));
+
+        // 5) PlayStatus(PLAYER_SPAWN) — terrain + player list shipped, client may render.
         PlayStatusPacket spawn = new PlayStatusPacket();
         spawn.setStatus(PlayStatusPacket.PLAYER_SPAWN);
         session.sendPackets(List.of(spawn));
