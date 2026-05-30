@@ -5,6 +5,7 @@ import net.butterfly.api.async.WorldView;
 import net.butterfly.api.command.CommandRegistry;
 import net.butterfly.api.entity.Player;
 import net.butterfly.api.event.EventBus;
+import net.butterfly.api.event.events.BlockBreakEvent;
 import net.butterfly.api.event.events.PlayerChatEvent;
 import net.butterfly.api.event.events.PlayerJoinEvent;
 import net.butterfly.api.event.events.PlayerPreLoginEvent;
@@ -13,6 +14,7 @@ import net.butterfly.api.event.events.ServerStartEvent;
 import net.butterfly.api.event.events.ServerStopEvent;
 import net.butterfly.api.plugin.PluginManager;
 import net.butterfly.api.plugin.Server;
+import net.butterfly.api.world.BlockState;
 import net.butterfly.api.world.World;
 import net.butterfly.codec.Protocol;
 import net.butterfly.core.command.CommandRegistryImpl;
@@ -35,6 +37,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
@@ -156,13 +159,25 @@ public final class ButterflyServer implements Server {
         // Once the handshake captures displayName + xuid (right before AWAIT_CHUNK_RADIUS_REQUEST),
         // build the PlayerImpl, run PreLogin checks, register them in the online roster and
         // broadcast Join. The hook fires on the tick thread (decode is dispatched there).
-        login.setOnPlayerSpawn(this::handlePlayerSpawn);
+        login.setOnPlayerSpawn(s -> handlePlayerSpawn(s, login));
 
         // Quit cleanup — invoked when the session is torn down (kick or transport drop).
         login.setOnSessionClosed(() -> handleSessionClosed(session));
 
         // Chat: dispatched from LoginFlowHandler's ACTIVE state for inbound Text packets.
         login.setOnChat(this::handleChat);
+
+        // Movement: dispatched from LoginFlowHandler's ACTIVE state for PlayerAuthInput
+        // (0x90). MVP only mirrors the values into the player's local state; broadcasting
+        // MovePlayer to other players is part of B2 (requires registering MovePlayer in
+        // butterfly-protocol's BedrockCodecs).
+        login.setOnAuthInput(this::handleAuthInput);
+
+        // Block interaction: dispatched for PlayerAction (0x24). MVP only reacts to
+        // CREATIVE_PLAYER_DESTROY_BLOCK (action 13) — fires BlockBreakEvent and, if not
+        // cancelled, sets the target block to air. Survival mining (START_BREAK +
+        // STOP_BREAK with mining progress) and BlockPlaceEvent dispatch are deferred.
+        login.setOnBlockAction(this::handleBlockAction);
 
         // Inbound batches arrive on the Netty event loop. Decode + dispatch mutate session
         // and world state and fire plugin events, so they MUST run on the tick thread.
@@ -194,7 +209,7 @@ public final class ButterflyServer implements Server {
      * player to the online roster and fire {@link PlayerJoinEvent}. Runs on the tick
      * thread.
      */
-    private void handlePlayerSpawn(ClientSession session) {
+    private void handlePlayerSpawn(ClientSession session, LoginFlowHandler login) {
         String name = session.displayName();
         String xuid = session.xuid();
         UUID uuid = uuidFor(name, xuid);
@@ -226,6 +241,10 @@ public final class ButterflyServer implements Server {
             catch (Exception e) { log.debug("kick on duplicate-join failed: {}", e.toString()); }
             return;
         }
+
+        // Bind the player onto the login handler so its ACTIVE-state dispatch can
+        // route per-tick movement / block-action packets to this PlayerImpl.
+        login.setSpawnedPlayer(player);
 
         // Join — fire the event with a default join message; listeners may rewrite it.
         String defaultJoin = name + " joined the game";
@@ -268,6 +287,68 @@ public final class ButterflyServer implements Server {
         String body = chat.getMessage();
         if (body == null || body.isEmpty()) return;
         broadcastChat(from, body);
+    }
+
+    /**
+     * Mirror the latest {@code PlayerAuthInput} (0x90) values into the player's local
+     * state. MVP only updates {@link PlayerImpl#setPosition} / {@link PlayerImpl#setRotation};
+     * broadcasting {@code MovePlayer} to other connected clients is part of B2 (requires
+     * the upstream codec to register {@code MovePlayer} so we can encode it).
+     *
+     * <p>Runs on the tick thread (the inbound batch is dispatched via
+     * {@link Scheduler#runOnMain(Runnable)}). Drops the update silently when the
+     * spawn callback hasn't fired yet — clients can begin pre-spawn sending these
+     * during the chunk burst before {@code AWAIT_PLAYER_INIT} flips to {@code ACTIVE}.
+     */
+    private void handleAuthInput(PlayerImpl player, float posX, float posY, float posZ,
+                                 float yaw, float pitch) {
+        if (player == null) return;
+        player.setPosition(posX, posY, posZ);
+        player.setRotation(yaw, pitch);
+    }
+
+    /**
+     * React to a {@code PlayerAction} (0x24). MVP only handles
+     * {@link PlayerActionPacket#ACTION_CREATIVE_PLAYER_DESTROY_BLOCK} (action 13) —
+     * fires {@link BlockBreakEvent}, and if the event isn't cancelled, replaces the
+     * target block with air via {@link WorldImpl#setBlock(int, int, int, BlockState)}.
+     *
+     * <p>Survival mining (action 0/2 with progress accounting), block placement
+     * (via {@code InventoryTransaction} 0x1E firing {@code BlockPlaceEvent}), and
+     * sending the resulting {@code UpdateBlock} packet back to other clients are
+     * deferred. {@code setBlock} expects to run on the simulate thread; it does
+     * because inbound batches are dispatched through {@code scheduler.runOnMain}.
+     */
+    private void handleBlockAction(PlayerImpl player, int actionType, int x, int y, int z) {
+        if (player == null) return;
+        if (actionType != net.butterfly.core.network.packets.PlayerActionPacket.ACTION_CREATIVE_PLAYER_DESTROY_BLOCK) {
+            return;
+        }
+        if (defaultWorld == null) return;
+
+        BlockState current;
+        try {
+            current = defaultWorld.getBlock(x, y, z);
+        } catch (RuntimeException e) {
+            log.debug("getBlock failed at ({}, {}, {}): {}", x, y, z, e.toString());
+            return;
+        }
+        String blockName = current != null ? current.name() : "minecraft:air";
+
+        BlockBreakEvent event = new BlockBreakEvent(
+            player.name(), x, y, z, blockName, new ArrayList<>());
+        try { eventBus.fire(event); }
+        catch (Exception e) { log.warn("BlockBreakEvent listener threw for {}: {}", player.name(), e.toString()); }
+        if (event.isCancelled()) return;
+
+        try {
+            defaultWorld.setBlock(x, y, z, BlockState.of("minecraft:air"));
+            log.info("block break by {} at ({}, {}, {}) [{}]",
+                player.name(), x, y, z, blockName);
+        } catch (RuntimeException e) {
+            log.warn("setBlock failed at ({}, {}, {}) for {}: {}",
+                x, y, z, player.name(), e.toString());
+        }
     }
 
     /**

@@ -4,6 +4,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import net.butterfly.codec.Packet;
 import net.butterfly.codec.PacketIds;
+import net.butterfly.codec.UnknownPacket;
 import net.butterfly.codec.packets.ClientToServerHandshakePacket;
 import net.butterfly.codec.packets.NetworkSettingsPacket;
 import net.butterfly.codec.packets.PlayStatusPacket;
@@ -11,7 +12,10 @@ import net.butterfly.codec.packets.RawCapturePacket;
 import net.butterfly.codec.packets.RequestNetworkSettingsPacket;
 import net.butterfly.codec.packets.ServerToClientHandshakePacket;
 import net.butterfly.codec.packets.TextPacket;
+import net.butterfly.core.entity.PlayerImpl;
 import net.butterfly.core.network.chunk.ChunkSender;
+import net.butterfly.core.network.packets.PlayerActionPacket;
+import net.butterfly.core.network.packets.PlayerAuthInputPacket;
 import net.butterfly.core.world.Chunk;
 import net.butterfly.core.world.SubChunk;
 import net.butterfly.core.world.WorldImpl;
@@ -637,6 +641,61 @@ public final class LoginFlowHandler {
         this.onChat = handler != null ? handler : (n, m) -> {};
     }
 
+    /**
+     * Hook invoked for every inbound {@code PlayerAuthInput} (0x90) the active session
+     * sees. Receives the spawned {@link PlayerImpl} (or {@code null} if spawn hasn't
+     * fired yet) plus the leading position/rotation floats. The default no-op drops
+     * the update; {@link ButterflyServer} installs a real handler that mirrors the
+     * values into the player's volatile state.
+     */
+    @FunctionalInterface
+    public interface AuthInputHandler {
+        void handle(PlayerImpl player, float posX, float posY, float posZ, float yaw, float pitch);
+    }
+
+    /**
+     * Hook invoked for every inbound {@code PlayerAction} (0x24) the active session
+     * sees. Receives the spawned {@link PlayerImpl} (or {@code null} if spawn hasn't
+     * fired yet) plus the action type and target block coordinates. The default
+     * no-op drops the action; {@link ButterflyServer} installs a real handler that
+     * fires {@code BlockBreakEvent} for action 13 and applies the world mutation.
+     */
+    @FunctionalInterface
+    public interface BlockActionHandler {
+        void handle(PlayerImpl player, int actionType, int x, int y, int z);
+    }
+
+    private AuthInputHandler onAuthInput = (p, x, y, z, yaw, pitch) -> {};
+    private BlockActionHandler onBlockAction = (p, a, x, y, z) -> {};
+
+    /**
+     * Spawned player handle. Set by {@link ButterflyServer} once
+     * {@link #setOnPlayerSpawn(Consumer)} has fired and a {@link PlayerImpl} has
+     * been admitted into the online roster. Remains {@code null} for sessions
+     * that never reach {@code ACTIVE} (kicked at PreLogin, duplicate name, etc).
+     */
+    private PlayerImpl spawnedPlayer;
+
+    /** Install the {@code PlayerAuthInput} dispatch hook. Pass {@code null} to clear. */
+    public void setOnAuthInput(AuthInputHandler handler) {
+        this.onAuthInput = handler != null ? handler : (p, x, y, z, yaw, pitch) -> {};
+    }
+
+    /** Install the {@code PlayerAction} dispatch hook. Pass {@code null} to clear. */
+    public void setOnBlockAction(BlockActionHandler handler) {
+        this.onBlockAction = handler != null ? handler : (p, a, x, y, z) -> {};
+    }
+
+    /**
+     * Bind the spawned {@link PlayerImpl} for this session. Invoked by the listener
+     * after {@link #setOnPlayerSpawn(Consumer)} has fired and the player has been
+     * admitted to the online roster. Pass {@code null} to clear when the session
+     * is torn down.
+     */
+    public void setSpawnedPlayer(PlayerImpl player) {
+        this.spawnedPlayer = player;
+    }
+
     private void handleActive(Packet packet) {
         if (packet.packetId() == PacketIds.TEXT && packet instanceof TextPacket text) {
             // Re-broadcast chat from the client. We use the server-known displayName
@@ -651,9 +710,92 @@ public final class LoginFlowHandler {
             }
             return;
         }
+        if (packet.packetId() == PlayerAuthInputPacket.ID) {
+            dispatchAuthInput(packet);
+            return;
+        }
+        if (packet.packetId() == PlayerActionPacket.ID) {
+            dispatchPlayerAction(packet);
+            return;
+        }
         // Plan B will route remaining active packets to the world / player layer. For
         // now we only log unknown packets so the rest of the test surface stays
         // predictable.
         log.debug("active packet id=0x{}", Integer.toHexString(packet.packetId()));
+    }
+
+    /**
+     * Decode the leading 8 floats of a PlayerAuthInput (0x90) — pitch, yaw, posX/Y/Z,
+     * moveX/Z, headYaw — and forward to the {@link AuthInputHandler}. The packet
+     * arrives as either a {@link RawCapturePacket} (when registered as raw) or an
+     * {@link UnknownPacket} (default fallback for ids the upstream codec doesn't
+     * know — 0x90 falls into this bucket today). We extract the verbatim body and
+     * route it through {@link PlayerAuthInputPacket} for the field-level decode so
+     * the handler receives typed values.
+     *
+     * <p>If the body is too short (e.g. an unexpected mid-packet truncation) the
+     * dispatch is dropped silently — desync is preferable to corrupting the player's
+     * recorded position.
+     */
+    private void dispatchAuthInput(Packet packet) {
+        ByteBuf body = bodyOf(packet);
+        if (body == null) return;
+        if (body.readableBytes() < PlayerAuthInputPacket.LEADING_FLOAT_COUNT * Float.BYTES) {
+            return;
+        }
+        PlayerAuthInputPacket decoded = new PlayerAuthInputPacket();
+        try {
+            decoded.decode(body);
+        } catch (RuntimeException e) {
+            log.debug("PlayerAuthInput decode failed: {}", e.toString());
+            return;
+        } finally {
+            ByteBuf tail = decoded.rawBody();
+            if (tail != null && tail.refCnt() > 0) tail.release();
+        }
+        try {
+            onAuthInput.handle(spawnedPlayer,
+                decoded.posX(), decoded.posY(), decoded.posZ(),
+                decoded.yaw(), decoded.pitch());
+        } catch (RuntimeException e) {
+            log.warn("onAuthInput hook threw for {}: {}", session.displayName(), e.toString());
+        }
+    }
+
+    /**
+     * Decode a PlayerAction (0x24) body and forward to the {@link BlockActionHandler}.
+     * The packet arrives as a {@link RawCapturePacket} (when registered as raw) or
+     * an {@link UnknownPacket} (default for ids absent from the upstream codec —
+     * 0x24 falls into this bucket today). Decode failures are logged and dropped —
+     * a malformed action shouldn't sever the session.
+     */
+    private void dispatchPlayerAction(Packet packet) {
+        ByteBuf body = bodyOf(packet);
+        if (body == null) return;
+        PlayerActionPacket decoded = new PlayerActionPacket();
+        try {
+            decoded.decode(body);
+        } catch (RuntimeException e) {
+            log.debug("PlayerAction decode failed: {}", e.toString());
+            return;
+        }
+        try {
+            onBlockAction.handle(spawnedPlayer,
+                decoded.actionType(),
+                decoded.blockX(), decoded.blockY(), decoded.blockZ());
+        } catch (RuntimeException e) {
+            log.warn("onBlockAction hook threw for {}: {}", session.displayName(), e.toString());
+        }
+    }
+
+    /**
+     * Extract the verbatim body bytes from a captured packet. Returns a duplicate
+     * (independent reader index) so the caller can decode without affecting other
+     * subscribers, or {@code null} if the packet type doesn't expose a raw body.
+     */
+    private static ByteBuf bodyOf(Packet packet) {
+        if (packet instanceof RawCapturePacket raw) return raw.rawBody().duplicate();
+        if (packet instanceof UnknownPacket unk) return unk.body().duplicate();
+        return null;
     }
 }
