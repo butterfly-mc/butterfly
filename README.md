@@ -1,12 +1,10 @@
-<p align="center">
-  <img src="butterfly.jpg" width="200">
-</p>
+<div align="center">
 
-<h1 align="center">Butterfly</h1>
+<img src="butterfly.jpg" width="140" alt="Butterfly">
 
-<p align="center">
-  A from-scratch Minecraft Bedrock Edition server software in **Java 21**.
-</p>
+# Butterfly
+
+A from-scratch Minecraft Bedrock Edition server software in **Java&nbsp;21**.
 
 <p align="center">
   <img src="https://img.shields.io/github/license/butterfly-mc/butterfly?style=flat-square">
