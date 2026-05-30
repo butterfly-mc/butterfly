@@ -17,6 +17,7 @@ dependencies {
     implementation(libs.disruptor)
     implementation(libs.hivemc.leveldb)
     implementation(libs.hivemc.leveldb.api)
+    implementation(libs.guava)
     implementation(libs.slf4j.api)
 
     testImplementation(libs.junit.jupiter)

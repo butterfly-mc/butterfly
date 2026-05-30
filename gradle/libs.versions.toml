@@ -10,6 +10,7 @@ slf4j = "2.0.13"
 log4j = "2.24.1"
 disruptor = "4.0.0"
 hivemcLeveldb = "1.1.0"
+guava = "33.4.0-jre"
 junit = "5.11.0"
 
 [libraries]
@@ -38,5 +39,6 @@ disruptor = { module = "com.lmax:disruptor", version.ref = "disruptor" }
 
 hivemc-leveldb = { module = "com.hivemc.leveldb:leveldb", version.ref = "hivemcLeveldb" }
 hivemc-leveldb-api = { module = "com.hivemc.leveldb:leveldb-api", version.ref = "hivemcLeveldb" }
+guava = { module = "com.google.guava:guava", version.ref = "guava" }
 
 junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit" }
