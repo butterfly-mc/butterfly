@@ -1,0 +1,226 @@
+package net.butterfly.core;
+
+import net.butterfly.api.async.Scheduler;
+import net.butterfly.api.async.WorldView;
+import net.butterfly.api.command.CommandRegistry;
+import net.butterfly.api.entity.Player;
+import net.butterfly.api.event.EventBus;
+import net.butterfly.api.event.events.ServerStartEvent;
+import net.butterfly.api.event.events.ServerStopEvent;
+import net.butterfly.api.plugin.PluginManager;
+import net.butterfly.api.plugin.Server;
+import net.butterfly.api.world.World;
+import net.butterfly.codec.Protocol;
+import net.butterfly.core.command.CommandRegistryImpl;
+import net.butterfly.core.command.DefaultCommands;
+import net.butterfly.core.event.EventBusImpl;
+import net.butterfly.core.network.ClientSession;
+import net.butterfly.core.network.ConnectionManager;
+import net.butterfly.core.network.LoginFlowHandler;
+import net.butterfly.core.network.LoginFlowHandler.ServerIdentity;
+import net.butterfly.core.plugin.PluginHost;
+import net.butterfly.core.tick.PhasedPipeline;
+import net.butterfly.core.tick.SchedulerImpl;
+import net.butterfly.core.tick.TickLoop;
+import net.butterfly.core.tick.WorldSnapshotPublisher;
+import net.butterfly.core.world.LevelDb;
+import net.butterfly.core.world.WorldImpl;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * The Butterfly server — facade that wires every core component together and exposes
+ * the {@link Server} interface to plugins. Lifecycle:
+ *
+ * <pre>
+ *   new ButterflyServer(config)
+ *     → start()    // open world, start tick loop, bind network, load+enable plugins
+ *     → (running)
+ *     → shutdown() // disable plugins, stop network, stop tick loop, close world
+ * </pre>
+ */
+public final class ButterflyServer implements Server {
+    private static final Logger log = LoggerFactory.getLogger(ButterflyServer.class);
+    private static final String VERSION = "0.1.0-MVP";
+
+    private final ServerConfig config;
+    private final EventBusImpl eventBus = new EventBusImpl();
+    private final CommandRegistryImpl commandRegistry = new CommandRegistryImpl();
+    private final TickLoop tickLoop = new TickLoop(20);
+    private final ForkJoinPool asyncPool = ForkJoinPool.commonPool();
+    private final SchedulerImpl scheduler;
+    private final ExecutorService decodePool = Executors.newWorkStealingPool();
+    private final ExecutorService encodePool = Executors.newWorkStealingPool();
+    private final WorldSnapshotPublisher snapshotPublisher = new WorldSnapshotPublisher();
+    private final ServerIdentity serverIdentity = ServerIdentity.generate();
+    private final ConcurrentHashMap<String, Player> onlineByName = new ConcurrentHashMap<>();
+    private final AtomicBoolean running = new AtomicBoolean(false);
+
+    private LevelDb levelDb;
+    private WorldImpl defaultWorld;
+    private ConnectionManager connectionManager;
+    private PluginHost pluginHost;
+    private PhasedPipeline pipeline;
+
+    public ButterflyServer(ServerConfig config) {
+        this.config = config;
+        this.scheduler = new SchedulerImpl(tickLoop, asyncPool);
+    }
+
+    public ServerConfig config() { return config; }
+
+    /** Open world, register defaults, start tick + network, load plugins. */
+    public void start() {
+        if (!running.compareAndSet(false, true)) throw new IllegalStateException("already started");
+        log.info("Butterfly v{} starting (protocol {} / MC {})", VERSION, Protocol.VERSION, Protocol.MINECRAFT_VERSION);
+
+        try {
+            ensureDirs();
+            openWorld();
+
+            DefaultCommands.registerAll(this, commandRegistry);
+
+            tickLoop.start();
+            tickLoop.setPostTickHook(() -> snapshotPublisher.publish(tickLoop.currentTick(), defaultWorld));
+            pipeline = new PhasedPipeline(decodePool, encodePool, this::peerHandles);
+            pipeline.installInto(tickLoop);
+
+            startNetwork();
+
+            pluginHost = new PluginHost(this, config.pluginsDir(), config.pluginDataDir());
+            pluginHost.loadAll();
+            pluginHost.enableAll();
+
+            eventBus.fire(new ServerStartEvent());
+            log.info("Server started on {}:{}", config.bindHost(), config.bindPort());
+        } catch (RuntimeException | IOException e) {
+            log.error("Startup failed; rolling back", e);
+            shutdownInternal();
+            if (e instanceof RuntimeException re) throw re;
+            throw new IllegalStateException(e);
+        }
+    }
+
+    private void ensureDirs() throws IOException {
+        Files.createDirectories(config.worldsDir());
+        Files.createDirectories(config.pluginsDir());
+        Files.createDirectories(config.pluginDataDir());
+    }
+
+    private void openWorld() throws IOException {
+        Files.createDirectories(config.worldDir());
+        levelDb = LevelDb.open(config.worldDir());
+        defaultWorld = new WorldImpl(config.levelName(), levelDb, 0, tickLoop.thread());
+        log.info("Opened world '{}' at {}", config.levelName(), config.worldDir());
+    }
+
+    private void startNetwork() {
+        ConnectionManager.Motd motd = new ConnectionManager.Motd(
+            config.serverName(),
+            Protocol.VERSION,
+            Protocol.MINECRAFT_VERSION,
+            0,
+            config.maxPlayers(),
+            config.levelName()
+        );
+        connectionManager = new ConnectionManager(motd, this::onSessionCreated);
+        try {
+            connectionManager.start(config.bindHost(), config.bindPort());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("interrupted while binding network", e);
+        }
+    }
+
+    private void onSessionCreated(ClientSession session) {
+        // Construct the login handler — its constructor wires session.onPackets(...).
+        new LoginFlowHandler(session, serverIdentity);
+        session.rak().onGameBatch(buf -> {
+            byte[] wire = new byte[buf.readableBytes()];
+            buf.readBytes(wire);
+            try {
+                session.handleInboundBatch(wire);
+            } catch (Exception e) {
+                log.warn("login flow error for {}: {}", session.rak().remote(), e.toString());
+            }
+        });
+    }
+
+    private Collection<net.butterfly.core.tick.PeerHandle> peerHandles() {
+        if (connectionManager == null) return Collections.emptyList();
+        return connectionManager.sessions().values().stream()
+            .<net.butterfly.core.tick.PeerHandle>map(PeerHandleAdapter::new)
+            .toList();
+    }
+
+    /** Adapter — for now the network layer + LoginFlowHandler decrypt+decode inline,
+     *  so the phased pipeline doesn't have decode/encode work to do per peer.
+     *  Plan B / future iterations move that work into the pipeline workers. */
+    private static final class PeerHandleAdapter implements net.butterfly.core.tick.PeerHandle {
+        @SuppressWarnings("unused") private final ClientSession session;
+        PeerHandleAdapter(ClientSession s) { this.session = s; }
+        @Override public byte[][] drainInbox() { return new byte[0][]; }
+        @Override public void simulate(byte[] batch) { /* no-op for MVP */ }
+        @Override public byte[][] drainOutbox() { return new byte[0][]; }
+        @Override public void encodeAndSend(byte[] batch) { /* no-op for MVP */ }
+    }
+
+    @Override
+    public void shutdown() {
+        if (!running.compareAndSet(true, false)) return;
+        log.info("Shutting down");
+        try {
+            eventBus.fire(new ServerStopEvent());
+        } catch (Exception e) {
+            log.warn("ServerStopEvent listener threw", e);
+        }
+        shutdownInternal();
+    }
+
+    private void shutdownInternal() {
+        if (pluginHost != null) {
+            try { pluginHost.disableAll(); } catch (Exception e) { log.warn("plugin disable error", e); }
+        }
+        if (connectionManager != null) {
+            try { connectionManager.stop(); } catch (Exception e) { log.warn("network stop error", e); }
+        }
+        try { tickLoop.stop(); } catch (Exception e) { log.warn("tick loop stop error", e); }
+        decodePool.shutdownNow();
+        encodePool.shutdownNow();
+        if (defaultWorld != null) {
+            try { defaultWorld.unloadAll(); } catch (Exception e) { log.warn("world unload error", e); }
+        }
+        if (levelDb != null) {
+            try { levelDb.close(); } catch (Exception e) { log.warn("leveldb close error", e); }
+        }
+        log.info("Shutdown complete");
+    }
+
+    // ---- Server interface ----
+    @Override public String version() { return VERSION; }
+    @Override public int protocolVersion() { return Protocol.VERSION; }
+    @Override public World defaultWorld() { return defaultWorld; }
+    @Override public WorldView worldSnapshot() {
+        WorldView v = snapshotPublisher.snapshot();
+        return v != null ? v : EmptyWorldView.INSTANCE;
+    }
+    @Override public EventBus eventBus() { return eventBus; }
+    @Override public PluginManager pluginManager() {
+        return pluginHost != null ? pluginHost.pluginManager() : EmptyPluginManager.INSTANCE;
+    }
+    @Override public CommandRegistry commandRegistry() { return commandRegistry; }
+    @Override public Scheduler scheduler() { return scheduler; }
+    @Override public Collection<? extends Player> onlinePlayers() { return List.copyOf(onlineByName.values()); }
+    @Override public Player playerByName(String name) { return name == null ? null : onlineByName.get(name); }
+}

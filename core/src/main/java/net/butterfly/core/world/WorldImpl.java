@@ -128,6 +128,18 @@ public final class WorldImpl implements World {
         }
     }
 
+    /** Save every dirty loaded chunk and clear the cache. Called during shutdown. */
+    public void unloadAll() {
+        java.util.List<Chunk> toUnload;
+        synchronized (loadedChunks) {
+            toUnload = new java.util.ArrayList<>(loadedChunks.values());
+            loadedChunks.clear();
+        }
+        for (Chunk c : toUnload) {
+            if (c.isDirty()) saveChunk(c);
+        }
+    }
+
     private Chunk ensureLoaded(int cx, int cz) {
         long key = packChunkKey(cx, cz);
         synchronized (loadedChunks) {
